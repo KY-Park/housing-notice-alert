@@ -2,110 +2,118 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
-from typing import Any
 
 import requests
+from bs4 import BeautifulSoup
 
 from services.normalizer import Notice, make_notice
 from utils.date import parse_date
 from utils.logger import get_logger
 
 
-BASE_URL = "http://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1"
-REGION_CODES = {"서울": "11", "경기": "41", "인천": "28"}
-NOTICE_TYPE_CODES = {
-    "05": "분양주택",
-    "06": "임대주택",
-    "39": "신혼희망타운",
-}
-STATUSES = ["공고중", "접수중", "정정공고중"]
+# LH청약플러스 임대/분양 공고문 목록 (서버 렌더링 HTML)
+LIST_URL = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancList.do"
+INFO_URL = "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do"
+HEADERS = {"User-Agent": "Mozilla/5.0 (housing-notice-alert)"}
 
 
-def _records(value: Any) -> list[dict[str, Any]]:
-    if isinstance(value, list):
-        if all(isinstance(item, dict) for item in value):
-            return value
-        return []
-    if isinstance(value, dict):
-        for key in ("dsList", "list", "items", "item", "data", "body"):
-            found = _records(value.get(key))
-            if found:
-                return found
-        candidates: list[dict[str, Any]] = []
-        for nested in value.values():
-            candidates.extend(_records(nested))
-        return candidates
-    return []
+def _detail_url(link) -> str:
+    # wrtancInfoBtn: data-id1=panId, id2=ccrCnntSysDsCd, id3=uppAisTpCd, id4=aisTpCd
+    pan_id = link.get("data-id1", "")
+    ccr = link.get("data-id2", "")
+    upp = link.get("data-id3", "")
+    ais = link.get("data-id4", "")
+    if not pan_id:
+        return LIST_URL + "?mi=1026"
+    return (
+        f"{INFO_URL}?panId={pan_id}&ccrCnntSysDsCd={ccr}"
+        f"&uppAisTpCd={upp}&aisTpCd={ais}&mi=1026"
+    )
+
+
+def _row_to_notice(row) -> Notice | None:
+    cells = row.find_all("td")
+    if len(cells) < 8:
+        return None
+
+    link = row.find("a", class_="wrtancInfoBtn")
+    if not link:
+        return None
+
+    span = link.find("span")
+    if span:
+        for em in span.find_all("em"):
+            em.extract()
+        title = span.get_text(" ", strip=True)
+    else:
+        title = link.get_text(" ", strip=True)
+    if not title:
+        return None
+
+    notice_type = cells[1].get_text(" ", strip=True)
+    region = cells[3].get_text(" ", strip=True)
+    notice_date = parse_date(cells[5].get_text(" ", strip=True))
+    apply_end = parse_date(cells[6].get_text(" ", strip=True))
+    status = cells[7].get_text(" ", strip=True)
+
+    return make_notice(
+        provider="LH",
+        region=region,
+        notice_type=notice_type,
+        title=title,
+        notice_date=notice_date,
+        apply_end_date=apply_end,
+        status=status,
+        url=_detail_url(link),
+    )
 
 
 def collect_lh() -> list[Notice]:
-    service_key = os.getenv("DATA_GO_KR_API_KEY")
-    if not service_key:
-        get_logger(__name__).warning("DATA_GO_KR_API_KEY is not set; skipping LH.")
-        return []
-
+    logger = get_logger(__name__)
     timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     lookback_days = int(os.getenv("LOOKBACK_DAYS", "90"))
-    start = (date.today() - timedelta(days=lookback_days)).strftime("%Y.%m.%d")
-    end = (date.today() + timedelta(days=365)).strftime("%Y.%m.%d")
+    max_pages = int(os.getenv("LH_MAX_PAGES", "5"))
+
+    start = (date.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end = date.today().strftime("%Y-%m-%d")
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
     notices: list[Notice] = []
     seen: set[str] = set()
-    session = requests.Session()
 
-    for region_name, region_code in REGION_CODES.items():
-        for type_code, type_name in NOTICE_TYPE_CODES.items():
-            for status in STATUSES:
-                page = 1
-                while page <= 20:
-                    params = {
-                        "ServiceKey": service_key,
-                        "PG_SZ": "100",
-                        "PAGE": str(page),
-                        "CNP_CD": region_code,
-                        "UPP_AIS_TP_CD": type_code,
-                        "PAN_SS": status,
-                        "PAN_NT_ST_DT": start,
-                        "CLSG_DT": end,
-                    }
-                    response = session.get(BASE_URL, params=params, timeout=timeout)
-                    response.raise_for_status()
-                    data = response.json()
-                    records = _records(data)
-                    if not records:
-                        break
+    for page in range(1, max_pages + 1):
+        params = {
+            "mi": "1026",
+            "currPage": str(page),
+            "srchY": "Y",
+            "startDt": start,
+            "endDt": end,
+            "schTy": "0",
+            "panSs": "",
+        }
+        response = session.get(LIST_URL, params=params, timeout=timeout)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
 
-                    for row in records:
-                        title = row.get("PAN_NM") or row.get("panNm") or row.get("title")
-                        url = row.get("DTL_URL") or row.get("dtlUrl") or row.get("url")
-                        if not title or not url:
-                            continue
-                        region_value = row.get("CNP_CD_NM") or region_name
-                        if region_value == "전국":
-                            region_value = region_name
-                        notice_date = parse_date(
-                            row.get("PAN_NT_ST_DT")
-                            or row.get("PAN_NT_ST_DTTM")
-                            or row.get("panNtStDt")
-                            or row.get("noticeDate")
-                        )
-                        close_date = parse_date(row.get("CLSG_DT") or row.get("clsgDt"))
-                        notice = make_notice(
-                            provider="LH",
-                            region=region_value,
-                            notice_type=row.get("AIS_TP_CD_NM") or row.get("UPP_AIS_TP_NM") or type_name,
-                            title=str(title),
-                            notice_date=notice_date,
-                            apply_end_date=close_date,
-                            status=row.get("PAN_SS") or status,
-                            url=str(url),
-                        )
-                        if notice.content_hash not in seen:
-                            notices.append(notice)
-                            seen.add(notice.content_hash)
+        table = soup.find("table")
+        rows = table.select("tbody tr") if table else []
+        # "등록된 데이터가 없습니다" 한 줄짜리 빈 결과 처리
+        if len(rows) <= 1 and (not rows or len(rows[0].find_all("td")) < 8):
+            break
 
-                    if len(records) < 100:
-                        break
-                    page += 1
+        page_count = 0
+        for row in rows:
+            notice = _row_to_notice(row)
+            if notice and notice.content_hash not in seen:
+                notices.append(notice)
+                seen.add(notice.content_hash)
+                page_count += 1
+
+        logger.info("LH page=%s rows=%s new=%s total=%s", page, len(rows), page_count, len(notices))
+        # 날짜검색 모드에서 마지막 페이지 이후 동일 결과가 반복되면 중단
+        if len(rows) < 50 or page_count == 0:
+            break
 
     return notices
